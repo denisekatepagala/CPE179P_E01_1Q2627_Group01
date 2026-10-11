@@ -12,8 +12,8 @@ Project Phasing
 (Completed) Part 4: UI & FastAPI
 - Build the user interface and backend. User should be able to upload/capture an image → process it → display English OCR text → display Tagalog translation.
 
-Part 5: Raspberry Pi Integration
+(Completed) Part 5: Raspberry Pi Integration
 - Move/test the complete software stack on the Raspberry Pi 4B. Check whether OCR, translation, FastAPI, and UI work properly on the Pi.
 
-Part 6: USB Camera & Final Integration
+(Completed) Part 6: USB Camera & Final Integration
 - Connect the USB webcam, capture an image directly from the camera, send it through the pipeline, display the English and Tagalog results, then perform final testing.
