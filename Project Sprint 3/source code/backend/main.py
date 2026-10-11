@@ -1,395 +1,290 @@
-import re
+
+import base64
+import io
+import os
+import threading
 
 import cv2
-import numpy as np
 import pytesseract
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+from transformers import pipeline
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
+app = FastAPI(title="English to Tagalog OCR Translator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# Raspberry Pi Linux Tesseract location
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-app = FastAPI(
-    title="English-Tagalog Translation API",
-    description="Tesseract OCR and English-to-Tagalog translation API",
-    version="1.0.0",
-)
+MODEL_NAME = "Helsinki-NLP/opus-mt-en-tl"
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Users\cristel\Downloads\CPE179P_Project\tesseract.exe"
-)
-
-TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-en-tl"
+translator = None
+translator_lock = threading.Lock()
 
 
-# ============================================================
-# LOAD TRANSLATION MODEL
-# ============================================================
+def get_translator():
+    """Load the translation model only when it is first needed."""
+    global translator
 
-print()
-print("===================================")
-print("LOADING TRANSLATION MODEL")
-print("===================================")
+    if translator is None:
+        with translator_lock:
+            if translator is None:
+                translator = pipeline(
+                    "translation",
+                    model=MODEL_NAME,
+                )
 
-print("Model:", TRANSLATION_MODEL)
-print("Please wait...")
-
-tokenizer = AutoTokenizer.from_pretrained(
-    TRANSLATION_MODEL
-)
-
-translation_model = AutoModelForSeq2SeqLM.from_pretrained(
-    TRANSLATION_MODEL
-)
-
-print("Translation model loaded successfully!")
+    return translator
 
 
-# ============================================================
-# IMAGE PREPROCESSING
-# ============================================================
+def encode_image(image):
+    """Convert an OpenCV image to a Base64 JPEG string."""
+    success, buffer = cv2.imencode(".jpg", image)
+
+    if not success:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not encode the captured image.",
+        )
+
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+
 
 def preprocess_image(image):
+    """Prepare an image to improve OCR readability."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2GRAY
-    )
+    # Enlarge small printed text
+    height, width = gray.shape
+    if width < 1200:
+        scale = 1200 / width
+        gray = cv2.resize(
+            gray,
+            (int(width * scale), int(height * scale)),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=3,
-        fy=3,
-        interpolation=cv2.INTER_CUBIC
-    )
+    # Improve contrast
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    gray = cv2.GaussianBlur(
-        gray,
-        (3, 3),
-        0
-    )
-
-    processed = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11
-    )
-
-    return processed
+    return gray
 
 
-# ============================================================
-# OCR ENGINE
-# ============================================================
-
-def ocr_engine(image):
+def extract_text(image):
+    """Run Tesseract OCR on an OpenCV image."""
+    processed = preprocess_image(image)
 
     text = pytesseract.image_to_string(
-        image,
-        config="--psm 12 --oem 3"
+        processed,
+        lang="eng",
+        config="--psm 6",
     )
 
-    lines = []
-
-    for line in text.splitlines():
-
-        line = line.strip()
-
-        if line:
-            lines.append(line)
-
-    text = " ".join(lines)
-
     return text.strip()
 
 
-# ============================================================
-# CLEAN OCR
-# ============================================================
-
-def clean_ocr_text(text):
-
-    text = " ".join(text.split())
-
-    text = text.replace("—~", "-")
-    text = text.replace("~—", "-")
-    text = text.replace("~~", "-")
-
-    text = text.replace("—", "-")
-    text = text.replace("–", "-")
-
-    text = text.replace(" .", ".")
-    text = text.replace(" ,", ",")
-    text = text.replace(" :", ":")
-    text = text.replace(" ;", ";")
-
-    text = text.replace("..", ".")
-    text = text.replace("::", ":")
-
-    return text.strip()
-
-
-# ============================================================
-# TRANSLATE ONE SENTENCE
-# ============================================================
-
-def translate_sentence(text):
-
+def translate_text(text):
+    """Translate recognized English text into Tagalog."""
     if not text.strip():
         return ""
 
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=128
+    model = get_translator()
+    result = model(text, max_length=512)
+
+    return result[0]["translation_text"].strip()
+
+
+def process_image_bytes(image_bytes):
+    """Decode image bytes, perform OCR, and translate the text."""
+    image_array = __import__("numpy").frombuffer(
+        image_bytes,
+        dtype=__import__("numpy").uint8,
     )
 
-    outputs = translation_model.generate(
-        **inputs,
-        max_length=128,
-        num_beams=5
-    )
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
-    translated = tokenizer.decode(
-        outputs[0],
-        skip_special_tokens=True
-    )
-
-    return translated.strip()
-
-
-# ============================================================
-# TRANSLATION ENGINE
-# ============================================================
-
-def translate_to_tagalog(text):
-
-    reference_pattern = (
-        r"\b[A-Z][a-z]+\s+\d+\s*:\s*\d+\b"
-    )
-
-    reference_match = re.search(
-        reference_pattern,
-        text
-    )
-
-    reference = None
-
-    if reference_match:
-
-        reference = reference_match.group(
-            0
-        ).strip()
-
-        translation_text = text.replace(
-            reference,
-            ""
-        ).strip()
-
-    else:
-
-        translation_text = text
-
-    translation_text = translation_text.rstrip(
-        " -—~"
-    ).strip()
-
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        translation_text
-    )
-
-    translated_sentences = []
-
-    for sentence in sentences:
-
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
-        translated = translate_sentence(
-            sentence
+    if image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded image could not be opened.",
         )
 
-        if translated:
-            translated_sentences.append(
-                translated
-            )
+    english_text = extract_text(image)
 
-    result = " ".join(
-        translated_sentences
-    )
+    if not english_text:
+        return {
+            "success": False,
+            "message": "No readable English text was detected.",
+            "extracted_text": "",
+            "translated_text": "",
+        }
 
-    if reference:
-
-        if result:
-            result += " - " + reference
-
-        else:
-            result = reference
-
-    return result
-
-
-# ============================================================
-# ROOT
-# ============================================================
-
-@app.get("/")
-def root():
+    tagalog_text = translate_text(english_text)
 
     return {
-        "message": "English-Tagalog Translation API is running."
+        "success": True,
+        "message": "Translation complete!",
+        "extracted_text": english_text,
+        "translated_text": tagalog_text,
     }
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
+@app.get("/")
+def home():
+    return {
+        "success": True,
+        "message": "English to Tagalog OCR backend is running.",
+    }
+
 
 @app.get("/health")
 def health():
-
     return {
-        "status": "ok"
+        "success": True,
+        "message": "Backend is reachable.",
     }
 
 
-# ============================================================
-# OCR ENDPOINT
-# ============================================================
+@app.post("/capture")
+def capture_image():
+    """Capture one image from the Raspberry Pi USB camera."""
+    camera = cv2.VideoCapture(0)
+
+    if not camera.isOpened():
+        camera.release()
+        raise HTTPException(
+            status_code=500,
+            detail="Cannot open the Raspberry Pi camera. "
+                   "Check the USB connection and camera index.",
+        )
+
+    try:
+        # Allow the camera a moment to initialize
+        frame = None
+
+        for _ in range(5):
+            success, current_frame = camera.read()
+            if success:
+                frame = current_frame
+
+        if frame is None:
+            raise HTTPException(
+                status_code=500,
+                detail="The camera opened but could not capture an image.",
+            )
+
+        return {
+            "success": True,
+            "message": "Image captured!",
+            "image_base64": encode_image(frame),
+        }
+
+    finally:
+        camera.release()
+
 
 @app.post("/ocr")
-async def ocr_endpoint(
-    file: UploadFile = File(...)
-):
+async def ocr_image(file: UploadFile = File(...)):
+    """Extract English text from an uploaded image."""
+    image_bytes = await file.read()
 
-    try:
-
-        image_data = await file.read()
-
-        image_array = np.frombuffer(
-            image_data,
-            np.uint8
-        )
-
-        image = cv2.imdecode(
-            image_array,
-            cv2.IMREAD_COLOR
-        )
-
-        if image is None:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to read image."
-            )
-
-        processed = preprocess_image(
-            image
-        )
-
-        english_text = ocr_engine(
-            processed
-        )
-
-        english_text = clean_ocr_text(
-            english_text
-        )
-
-        return {
-            "english_text": english_text
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-
+    if not image_bytes:
         raise HTTPException(
-            status_code=500,
-            detail=str(error)
+            status_code=400,
+            detail="The uploaded image is empty.",
         )
 
+    image = cv2.imdecode(
+        __import__("numpy").frombuffer(
+            image_bytes,
+            dtype=__import__("numpy").uint8,
+        ),
+        cv2.IMREAD_COLOR,
+    )
 
-# ============================================================
-# TRANSLATION ENDPOINT
-# ============================================================
+    if image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a supported image.",
+        )
+
+    text = extract_text(image)
+
+    return {
+        "success": bool(text),
+        "extracted_text": text,
+        "message": "OCR complete." if text else "No readable text detected.",
+    }
+
 
 @app.post("/translate")
-async def translate_endpoint(
-    file: UploadFile = File(...)
-):
+async def translate_image(file: UploadFile = File(...)):
+    """Extract English text and translate it into Tagalog."""
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded image is empty.",
+        )
 
     try:
-
-        image_data = await file.read()
-
-        image_array = np.frombuffer(
-            image_data,
-            np.uint8
-        )
-
-        image = cv2.imdecode(
-            image_array,
-            cv2.IMREAD_COLOR
-        )
-
-        if image is None:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to read image."
-            )
-
-        processed = preprocess_image(
-            image
-        )
-
-        english_text = ocr_engine(
-            processed
-        )
-
-        english_text = clean_ocr_text(
-            english_text
-        )
-
-        if not english_text:
-
-            return {
-                "english_text": "",
-                "tagalog_text": "",
-                "message": "No text detected."
-            }
-
-        tagalog_text = translate_to_tagalog(
-            english_text
-        )
-
-        return {
-            "english_text": english_text,
-            "tagalog_text": tagalog_text
-        }
-
+        return process_image_bytes(image_bytes)
     except HTTPException:
         raise
-
-    except Exception as error:
-
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=str(error)
+            detail=f"Image processing failed: {exc}",
         )
+
+
+@app.post("/capture-and-translate")
+def capture_and_translate():
+    """Optional endpoint to capture and translate in one request."""
+    camera = cv2.VideoCapture(0)
+
+    if not camera.isOpened():
+        camera.release()
+        raise HTTPException(
+            status_code=500,
+            detail="Cannot open the Raspberry Pi camera.",
+        )
+
+    try:
+        frame = None
+
+        for _ in range(5):
+            success, current_frame = camera.read()
+            if success:
+                frame = current_frame
+
+        if frame is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not capture an image.",
+            )
+
+        image_base64 = encode_image(frame)
+        success, buffer = cv2.imencode(".jpg", frame)
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not encode the captured image.",
+            )
+
+        result = process_image_bytes(buffer.tobytes())
+        result["image_base64"] = image_base64
+        return result
+
+    finally:
+        camera.release()
