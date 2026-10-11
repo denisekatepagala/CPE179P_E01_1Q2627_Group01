@@ -3,6 +3,10 @@ import requests
 import base64
 import os
 import mimetypes
+import asyncio
+import cv2
+import tkinter as tk
+from tkinter import filedialog
 
 API_URL = "http://127.0.0.1:8000/translate"
 
@@ -53,8 +57,6 @@ class TranslatorApp:
             size=14,
             color=self.muted,
         )
-
-        self.file_picker = ft.FilePicker()
 
         self.content = ft.Container(
             expand=True,
@@ -170,8 +172,8 @@ class TranslatorApp:
                     color=self.muted,
                 ),
                 ft.Card(
-                    bgcolor=self.card_color,
                     content=ft.Container(
+                        bgcolor=self.card_color,
                         padding=25,
                         content=ft.Column(
                             controls=[
@@ -253,9 +255,9 @@ class TranslatorApp:
 
     def info_card(self, icon, title, description):
         return ft.Card(
-            bgcolor=self.card_color,
             content=ft.Container(
                 width=210,
+                bgcolor=self.card_color,
                 padding=20,
                 content=ft.Column(
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -305,9 +307,9 @@ class TranslatorApp:
                     vertical_alignment=ft.CrossAxisAlignment.START,
                     controls=[
                         ft.Card(
-                            bgcolor=self.card_color,
                             content=ft.Container(
                                 width=500,
+                                bgcolor=self.card_color,
                                 padding=25,
                                 content=ft.Column(
                                     spacing=15,
@@ -349,22 +351,41 @@ class TranslatorApp:
                                             alignment=ft.Alignment.CENTER,
                                             content=self.preview,
                                         ),
-                                        ft.Button(
-                                            content="Choose Image",
-                                            width=450,
-                                            height=48,
-                                            bgcolor=self.secondary,
-                                            color=ft.Colors.WHITE,
-                                            on_click=self.choose_image,
+                                        ft.Row(
+                                            spacing=10,
+                                            controls=[
+                                                ft.Container(
+                                                    expand=True,
+                                                    content=ft.Button(
+                                                        content="Choose Image",
+                                                        width=float("inf"),
+                                                        height=48,
+                                                        bgcolor=self.secondary,
+                                                        color=ft.Colors.WHITE,
+                                                        on_click=self.choose_image,
+                                                    ),
+                                                ),
+                                                ft.Container(
+                                                    expand=True,
+                                                    content=ft.Button(
+                                                        content="Capture Image",
+                                                        width=float("inf"),
+                                                        height=48,
+                                                        bgcolor=self.primary,
+                                                        color=ft.Colors.WHITE,
+                                                        on_click=self.capture_image,
+                                                    ),
+                                                ),
+                                            ],
                                         ),
                                     ],
                                 ),
                             ),
                         ),
                         ft.Card(
-                            bgcolor=self.card_color,
                             content=ft.Container(
                                 width=500,
+                                bgcolor=self.card_color,
                                 padding=25,
                                 content=ft.Column(
                                     spacing=15,
@@ -417,91 +438,150 @@ class TranslatorApp:
             ],
         )
 
+    def _open_image_dialog(self):
+        """Use the operating system's native image-selection dialog."""
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            return filedialog.askopenfilename(
+                parent=root,
+                title="Choose an image containing English text",
+                filetypes=[
+                    ("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+        finally:
+            root.destroy()
+
     async def choose_image(self, e):
-        files = await self.file_picker.pick_files(
-            allow_multiple=False,
-        )
+        try:
+            image_path = await asyncio.to_thread(self._open_image_dialog)
+            if not image_path:
+                return
 
-        if not files:
-            return
+            self.selected_image = image_path
+            with open(image_path, "rb") as image_file:
+                encoded = base64.b64encode(image_file.read()).decode("utf-8")
 
-        selected_file = files[0]
-        self.selected_image = selected_file.path
-
-        if not self.selected_image or not os.path.isfile(self.selected_image):
-            self.status_text.value = "Unable to access the selected image."
+            self.preview.src = f"data:{mimetypes.guess_type(image_path)[0] or 'image/jpeg'};base64,{encoded}"
+            self.preview.visible = True
+            self.english_text.value = ""
+            self.tagalog_text.value = ""
+            self.status_text.value = "Image selected. Click Capture & Translate."
+            self.status_text.color = self.success
+        except Exception as ex:
+            self.status_text.value = f"Unable to choose image: {ex}"
+            self.status_text.color = "#C62828"
+        finally:
             self.page.update()
-            return
 
-        with open(self.selected_image, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("utf-8")
+    def _capture_webcam_image(self):
+        """Open the default webcam, capture one frame, save it, and release it."""
+        camera = cv2.VideoCapture(0)
+        try:
+            if not camera.isOpened():
+                raise RuntimeError(
+                    "Cannot open webcam. Check camera permissions or connection."
+                )
 
-        self.preview.src = encoded
-        self.preview.visible = True
+            success, frame = camera.read()
+            if not success or frame is None:
+                raise RuntimeError("The webcam did not return an image.")
 
-        self.english_text.value = ""
-        self.tagalog_text.value = ""
-        self.status_text.value = "Image selected."
+            image_path = os.path.abspath("captured_image.jpg")
+            if not cv2.imwrite(image_path, frame):
+                raise RuntimeError("Could not save the captured image.")
 
+            return image_path
+        finally:
+            camera.release()
+
+    async def capture_image(self, e):
+        self.status_text.value = "Opening webcam..."
+        self.status_text.color = self.muted
         self.page.update()
 
-    def translate(self, e):
-        if self.selected_image is None:
-            self.status_text.value = "Please choose an image first."
+        try:
+            image_path = await asyncio.to_thread(self._capture_webcam_image)
+            self.selected_image = image_path
+
+            with open(image_path, "rb") as image_file:
+                encoded = base64.b64encode(image_file.read()).decode("utf-8")
+
+            self.preview.src = encoded
+            self.preview.visible = True
+            self.english_text.value = ""
+            self.tagalog_text.value = ""
+            self.status_text.value = "Image captured. Click Capture & Translate."
+            self.status_text.color = self.success
+
+        except Exception as ex:
+            self.status_text.value = f"Camera error: {ex}"
+            self.status_text.color = "#C62828"
+        finally:
+            self.page.update()
+
+    async def translate(self, e):
+        if not self.selected_image:
+            self.status_text.value = "Please choose or capture an image first."
+            self.status_text.color = "#C62828"
             self.page.update()
             return
 
         self.loading.visible = True
         self.status_text.value = "Processing image..."
+        self.status_text.color = self.muted
         self.english_text.value = ""
         self.tagalog_text.value = ""
         self.page.update()
 
         try:
-            mime_type = mimetypes.guess_type(self.selected_image)[0]
-            if not mime_type:
-                mime_type = "application/octet-stream"
-
-            with open(self.selected_image, "rb") as f:
-                response = requests.post(
-                    API_URL,
-                    files={
-                        "file": (
-                            os.path.basename(self.selected_image),
-                            f,
-                            mime_type,
-                        )
-                    },
-                    timeout=180,
-                )
-
-            response.raise_for_status()
-            data = response.json()
-
+            data = await asyncio.to_thread(self._send_image_to_backend, self.selected_image)
             self.english_text.value = data.get("english_text", "")
             self.tagalog_text.value = data.get("tagalog_text", "")
 
-            if not self.english_text.value:
-                self.status_text.value = "No text detected."
+            if not self.english_text.value.strip():
+                self.status_text.value = "No English text detected. Try a clearer image."
+                self.status_text.color = "#C62828"
             else:
                 self.status_text.value = "Translation complete."
+                self.status_text.color = self.success
 
         except requests.exceptions.ConnectionError:
             self.status_text.value = (
-                "Cannot connect to FastAPI. "
-                "Make sure the backend is running."
+                "Cannot connect to FastAPI. Make sure the backend is running."
             )
+            self.status_text.color = "#C62828"
         except requests.exceptions.Timeout:
             self.status_text.value = "The request took too long."
+            self.status_text.color = "#C62828"
         except requests.exceptions.HTTPError as ex:
             self.status_text.value = f"Backend error: {ex}"
-        except ValueError:
-            self.status_text.value = "Backend returned invalid JSON."
+            self.status_text.color = "#C62828"
+        except (ValueError, KeyError) as ex:
+            self.status_text.value = f"Invalid backend response: {ex}"
+            self.status_text.color = "#C62828"
         except Exception as ex:
             self.status_text.value = f"Error: {ex}"
+            self.status_text.color = "#C62828"
         finally:
             self.loading.visible = False
             self.page.update()
+
+    def _send_image_to_backend(self, image_path):
+        mime_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
+        with open(image_path, "rb") as image_file:
+            response = requests.post(
+                API_URL,
+                files={
+                    "file": (os.path.basename(image_path), image_file, mime_type)
+                },
+                timeout=300,
+            )
+        response.raise_for_status()
+        return response.json()
 
 
 def main(page: ft.Page):
@@ -509,7 +589,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.run(
-        main,
-        assets_dir="assets",
-    )
+    ft.run(main)
